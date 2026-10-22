@@ -23,9 +23,11 @@ except ImportError:
         )
         sys.exit(1)
 
+from dmcd import __version__
 from dmcd.app import app
 from dmcd.server import start_tcp_server, start_key_exchange_server, cleanup_tasks
 from dmcd.sessions import send_to_client
+from dmcd.s2s import log_message
 from dmcd.client import handle_client, receive_from_client  # noqa: F401 (compat)
 
 
@@ -40,6 +42,7 @@ def _load_capabilities():
 
 
 def main():
+    log_message(f"LibreDM {__version__} starting")
     _load_capabilities()
     threading.Thread(target=cleanup_tasks, args=(app,), daemon=True).start()
     threading.Thread(target=start_key_exchange_server, args=(app,), daemon=True).start()

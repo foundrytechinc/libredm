@@ -2,7 +2,7 @@
 
 import re
 
-from dmcd import config
+from dmcd import __version__, config
 from dmcd import crypto
 from dmcd.rooms import (
     display_name_for,
@@ -105,7 +105,7 @@ def handle_command(message: str, ctx: CommandContext) -> None:
     elif message.startswith("/search"):
         _cmd_search(message, ctx)
     elif message.startswith("/help"):
-        ctx.reply("\n".join(f"{cmd} {desc}" for cmd, desc in COMMANDS.items()))
+        ctx.reply(f"LibreDM {__version__}\n" + "\n".join(f"{cmd} {desc}" for cmd, desc in COMMANDS.items()))
     elif message.startswith("/list_capabilities"):
         _cmd_list_capabilities(ctx)
     elif message.startswith("/") and not is_ping(message) and not any(

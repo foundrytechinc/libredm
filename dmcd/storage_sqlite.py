@@ -136,18 +136,22 @@ class SQLiteRoomStore:
         return cur.fetchone() is not None
 
     def create(self, room_name):
+        """Create a room. Returns True if created, False if it already exists."""
         db = self.conn.get()
-        db.execute(
+        cur = db.execute(
             "INSERT OR IGNORE INTO rooms (name, created_at) VALUES (?, ?)",
             (room_name, datetime.utcnow().isoformat()),
         )
         db.commit()
+        return cur.rowcount > 0
 
     def delete(self, room_name):
+        """Delete a room. Returns True if deleted, False if it did not exist."""
         db = self.conn.get()
         # Foreign key cascade will delete members
-        db.execute("DELETE FROM rooms WHERE name = ?", (room_name,))
+        cur = db.execute("DELETE FROM rooms WHERE name = ?", (room_name,))
         db.commit()
+        return cur.rowcount > 0
 
     def add_member(self, room_name, username):
         db = self.conn.get()

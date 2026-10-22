@@ -32,7 +32,7 @@ unauthenticated S2S by default.
 | Piece | What it is |
 |---|---|
 | Chat server | Rooms (`/join_server`), private messages (`/pm`), `/act`, `/help` |
-| Clients | Anything that speaks DMConnect-style plain TCP — including the official-style `dsconnect.py` GUI and plain Telnet |
+| Clients | Anything that speaks DMConnect-style plain TCP — like `dsconnect` or any DMconnect client GUI and plain Telnet |
 | Ports | `42439` plain text, `42440` Diffie-Hellman encrypted |
 | Storage | SQLite by default, JSON optional |
 | Auth | Username + password (PBKDF2-SHA256), rate limits, account lockout |
@@ -116,7 +116,7 @@ project root, not under whatever directory you happened to `cd` into.
 
 **Client protocol — compatible with DMConnect.**
 
-The official-style Python client (`dsconnect.py`) works: plain TCP, commands
+Tеsted on DSConnect Client, it works: plain TCP, commands
 like `/login user pass` (no newline required), keepalive `/`, message format
 `nick: text`. You can also use Telnet.
 

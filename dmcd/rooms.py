@@ -157,7 +157,7 @@ def broadcast_message(
     try:
         sessions = registry.room_sessions(server_name)
         from dmcd.s2s import log_message
-        log_message(f"broadcast to '{server_name}': {len(sessions)} sessions, type={message_type}, message='{message[:80]}'")
+        log_message(f"broadcast to '{server_name}': {len(sessions)} sessions, type={message_type}")
         for sess in sessions:
             if sender_session is not None and sess is sender_session:
                 continue
@@ -169,10 +169,8 @@ def broadcast_message(
                 and filter_fn
                 and filter_fn(sess.username, sender, "server")
             ):
-                log_message(f"  → filtered for {sess.username}")
                 continue
             from dmcd.sessions import send_to_client
-            result = send_to_client(sess.client_socket, message, sess.client_key, message_type)
-            log_message(f"  → sent to {sess.username}: {result}")
+            send_to_client(sess.client_socket, message, sess.client_key, message_type)
     except Exception:
         pass

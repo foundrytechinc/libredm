@@ -34,3 +34,49 @@ class RateLimiter:
             if not ts:
                 del self._hits[k]
         self._last_sweep = now
+
+
+class AccountLockout:
+    """Lock an account after repeated failed logins (anti-brute-force)."""
+
+    def __init__(self, max_failures: int, window_seconds: float, lockout_seconds: float):
+        self.max_failures = max_failures
+        self.window = window_seconds
+        self.lockout = lockout_seconds
+        self._failures = {}  # username -> (last_fail_ts, [fail_ts, ...])
+        self._locked_until = {}  # username -> unlock_ts
+        self._lock = threading.Lock()
+
+    def is_locked(self, username: str):
+        """Return remaining lockout seconds (float), or 0.0 if not locked."""
+        now = time.time()
+        with self._lock:
+            until = self._locked_until.get(username)
+            if until is None:
+                return 0.0
+            if now >= until:
+                del self._locked_until[username]
+                self._failures.pop(username, None)
+                return 0.0
+            return until - now
+
+    def record_failure(self, username: str):
+        """Record a failed login. Returns remaining lockout seconds (0 if none)."""
+        now = time.time()
+        with self._lock:
+            if now < self._locked_until.get(username, 0):
+                return self._locked_until[username] - now
+            _, stamps = self._failures.get(username, (now, []))
+            stamps = [t for t in stamps if now - t < self.window]
+            stamps.append(now)
+            self._failures[username] = (now, stamps)
+            if len(stamps) >= self.max_failures:
+                self._locked_until[username] = now + self.lockout
+                self._failures.pop(username, None)
+                return self.lockout
+            return 0.0
+
+    def clear(self, username: str):
+        with self._lock:
+            self._failures.pop(username, None)
+            self._locked_until.pop(username, None)

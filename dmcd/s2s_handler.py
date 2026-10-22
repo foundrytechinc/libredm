@@ -1,7 +1,5 @@
 """Inbound S2S message processing with dialback enforcement."""
 
-import threading
-
 from dmcd import config
 from dmcd.rooms import (
     format_room_event_text,
@@ -9,6 +7,7 @@ from dmcd.rooms import (
 )
 from dmcd.s2s import generate_msg_id, log_message
 from dmcd.sessions import send_to_client
+from dmcd.sanitize import sanitize_text, strip_controls
 
 
 def _close(sock):
@@ -18,10 +17,35 @@ def _close(sock):
         pass
 
 
+def _client_ip(client_address):
+    if isinstance(client_address, tuple) and client_address:
+        return str(client_address[0])
+    return str(client_address)
+
+
 def process_s2s_message(msg, reply, sock, client_address, a):
+    ip = _client_ip(client_address)
+    if not a.s2s_limiter.allow(ip):
+        reply({"status": "error", "reason": "rate_limited"})
+        _close(sock)
+        return
+
+    if not isinstance(msg, dict):
+        reply({"status": "error", "reason": "bad_request"})
+        _close(sock)
+        return
+
     msg_type = msg.get("type")
     from_host = msg.get("from_host")
     msg_id = msg.get("msg_id")
+
+    # Capability probe is unauthenticated by design (discovery only).
+    if msg_type != "s2s_cap" and config.S2S_REQUIRE_SIGNATURE:
+        identity = getattr(a, "s2s_identity", None)
+        if identity is None or not identity.verify_message(msg, from_host):
+            reply({"status": "error", "reason": "signature_invalid"})
+            _close(sock)
+            return
 
     if msg_type == "s2s_cap":
         reply({"status": "ok", "encrypted": True})
@@ -49,8 +73,9 @@ def process_s2s_message(msg, reply, sock, client_address, a):
 
     if msg_type == "status_request":
         usernames = msg.get("usernames")
-        if not usernames:
+        if not isinstance(usernames, list):
             usernames = [msg.get("username", "")] if msg.get("username") else []
+        usernames = [u for u in usernames[: config.S2S_MAX_USERNAMES_PER_REQUEST] if isinstance(u, str)]
         online_map = {u: a.sessions.is_user_online(u) for u in usernames}
         reply({"status": "ok", "online_map": online_map})
         _close(sock)
@@ -68,9 +93,13 @@ def process_s2s_message(msg, reply, sock, client_address, a):
                     reply({"status": "error", "reason": "Dialback failed"})
                     _close(sock)
                     return
-                sender = msg.get("sender")
-                recipient = msg.get("recipient")
-                message = msg.get("message")
+                sender = strip_controls(str(msg.get("sender") or ""))[: config.MAX_USERNAME_LENGTH]
+                recipient = strip_controls(str(msg.get("recipient") or ""))[: config.MAX_USERNAME_LENGTH]
+                message = sanitize_text(str(msg.get("message") or ""))
+                if not sender or not recipient or not message:
+                    reply({"status": "error", "reason": "bad_request"})
+                    _close(sock)
+                    return
                 if not a.users.exists(recipient):
                     reply({"status": "error", "reason": "user_not_found"})
                     _close(sock)
@@ -89,7 +118,9 @@ def process_s2s_message(msg, reply, sock, client_address, a):
                 except Exception:
                     pass
 
-        threading.Thread(target=async_dialback, daemon=True).start()
+        if not a.task_pool.submit(async_dialback):
+            reply({"status": "error", "reason": "busy"})
+            _close(sock)
         return
 
     if msg_type in ("presence_subscribe", "presence_unsubscribe", "presence_update"):
@@ -125,7 +156,9 @@ def process_s2s_message(msg, reply, sock, client_address, a):
                 except Exception:
                     pass
 
-        threading.Thread(target=async_presence, daemon=True).start()
+        if not a.task_pool.submit(async_presence):
+            reply({"status": "error", "reason": "busy"})
+            _close(sock)
         return
 
     if msg_type in (
@@ -138,6 +171,7 @@ def process_s2s_message(msg, reply, sock, client_address, a):
                 sender = msg.get("sender", "")
 
                 # Dialback: peer must prove it originated this message.
+                # Compare against the original fields (do not sanitize first).
                 ok = a.dialback.check(
                     from_host, msg_id, msg_type,
                     sender=sender if msg_type != "room_members_request" else None,
@@ -148,6 +182,8 @@ def process_s2s_message(msg, reply, sock, client_address, a):
                     reply({"status": "error", "reason": "Dialback failed"})
                     _close(sock)
                     return
+
+                sender = strip_controls(str(sender or ""))[: config.MAX_USERNAME_LENGTH]
 
                 if msg_type == "room_event":
                     _handle_room_event(a, msg, from_host, reply, sock)
@@ -199,6 +235,14 @@ def process_s2s_message(msg, reply, sock, client_address, a):
                         _close(sock)
                         return
                     payload = msg.get("payload") or {}
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    if "text" in payload:
+                        payload = dict(payload)
+                        payload["text"] = sanitize_text(str(payload.get("text") or ""))
+                    if "act" in payload:
+                        payload = dict(payload)
+                        payload["act"] = sanitize_text(str(payload.get("act") or ""), 200)
                     event = "message" if msg_type == "room_message" else "act"
                     _broadcast_local(a, room, event, sender, from_host, payload)
                     _fanout_remotes(a, room, event, sender, from_host, payload)
@@ -214,10 +258,14 @@ def process_s2s_message(msg, reply, sock, client_address, a):
                     pass
 
         cached = a.dialback.cached(from_host, msg_type) if from_host else None
-        if cached is True:
-            _room_worker()
-        else:
-            threading.Thread(target=_room_worker, daemon=True).start()
+        if cached is False:
+            # Recent failed dialback — reject immediately without another round-trip.
+            reply({"status": "error", "reason": "Dialback failed"})
+            _close(sock)
+            return
+        if not a.task_pool.submit(_room_worker):
+            reply({"status": "error", "reason": "busy"})
+            _close(sock)
         return
 
     reply({"status": "error", "reason": "unknown_type"})
@@ -226,9 +274,17 @@ def process_s2s_message(msg, reply, sock, client_address, a):
 
 def _handle_room_event(a, msg, from_host, reply, sock):
     event = msg.get("event")
-    sender = msg.get("sender")
+    sender = strip_controls(str(msg.get("sender") or ""))[: config.MAX_USERNAME_LENGTH]
     sender_origin = msg.get("sender_origin") or from_host
     payload = msg.get("payload") or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    else:
+        payload = dict(payload)
+    if "text" in payload:
+        payload["text"] = sanitize_text(str(payload.get("text") or ""))
+    if "act" in payload:
+        payload["act"] = sanitize_text(str(payload.get("act") or ""), 200)
     room = msg.get("room")
 
     if from_host != config.MY_SERVER_HOST and (sender, sender_origin) in a.rooms.members_map(room):
@@ -246,14 +302,9 @@ def _handle_room_event(a, msg, from_host, reply, sock):
                      room_key=room_key, exclude_username=exclude)
 
     if event in ("message", "act") and sender_origin != config.MY_SERVER_HOST:
-        try:
-            threading.Thread(
-                target=_fanout_remotes,
-                args=(a, room, event, sender, sender_origin, payload),
-                daemon=True,
-            ).start()
-        except Exception:
-            pass
+        a.task_pool.submit_thread(
+            _fanout_remotes, a, room, event, sender, sender_origin, payload
+        )
     reply({"status": "ok"})
     _close(sock)
 

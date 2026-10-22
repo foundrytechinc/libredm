@@ -25,16 +25,17 @@ def migrate():
 
     # Initialize SQLite database schema
     from dmcd.storage_sqlite import init_db
-    init_db(config.DATABASE_FILE)
+    db_path = config.data_path(config.DATABASE_FILE)
+    init_db(db_path)
 
     # Load JSON stores
-    json_users = UserStore(config.USERS_FILE)
-    json_bans = BanStore(config.BANS_FILE)
-    json_rooms = RoomStore(config.SERVERS_DIR)
-    json_tokens = TokenStore(config.UPLOAD_TOKENS_FILE)
+    json_users = UserStore(config.data_path(config.USERS_FILE))
+    json_bans = BanStore(config.data_path(config.BANS_FILE))
+    json_rooms = RoomStore(config.data_path(config.SERVERS_DIR))
+    json_tokens = TokenStore(config.data_path(config.UPLOAD_TOKENS_FILE))
 
     # Create SQLite connection
-    db = SQLiteConnection(config.DATABASE_FILE)
+    db = SQLiteConnection(db_path)
 
     # Initialize SQLite stores
     sqlite_users = SQLiteUserStore(db)

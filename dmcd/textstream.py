@@ -257,6 +257,8 @@ class TextStream:
         return True
 
     def _insert_byte(self, sock, b: int):
+        if len(self.pending) >= config.MAX_LINE_BYTES:
+            return
         self.pending = self.pending[: self.cursor] + bytes([b]) + self.pending[self.cursor :]
         self.cursor += 1
         if not self.echo:
@@ -352,7 +354,8 @@ class TextStream:
                     self._handle_escape_sequence(sock, seq[1:] if seq[:1] == b"[" else seq)
                 continue
             if b in (13, 10):
-                self.pending += bytes([b])
+                if len(self.pending) < config.MAX_LINE_BYTES:
+                    self.pending += bytes([b])
                 i += 1
                 continue
             if b < 32:
@@ -400,6 +403,8 @@ class TextStream:
             return None
         data = self.pending + chunk if chunk else self.pending
         self.pending = b""
+        if len(data) > config.MAX_LINE_BYTES:
+            data = data[: config.MAX_LINE_BYTES]
         data = self._strip_keepalive_prefix(data)
         for sep in (b"\r\n", b"\n", b"\r"):
             idx = data.find(sep)

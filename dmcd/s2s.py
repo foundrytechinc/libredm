@@ -65,10 +65,11 @@ class DialbackLedger:
 
 
 class S2SLink:
-    def __init__(self, my_host_fn, outbound_ledger: DialbackLedger):
+    def __init__(self, my_host_fn, outbound_ledger: DialbackLedger, identity=None):
         self.port = config.TCP_PORT
         self.my_host_fn = my_host_fn
         self.outbound = outbound_ledger
+        self.identity = identity
         self._lock = threading.RLock()
         self._caps = {}
         self._sessions = {}
@@ -177,6 +178,9 @@ class S2SLink:
     # -- public API --------------------------------------------------------
 
     def probe_cap(self, host, timeout=config.S2S_CONNECT_TIMEOUT):
+        from dmcd.s2s_identity import is_allowed_s2s_host
+        if not is_allowed_s2s_host(host):
+            return None
         cached = self._cap_get(host)
         if cached:
             return cached
@@ -186,7 +190,7 @@ class S2SLink:
             with socket.create_connection((host, self.port), timeout=timeout) as sock:
                 _tcp_nodelay(sock)
                 sock.sendall(payload)
-                sock.settimeout(2)
+                sock.settimeout(config.S2S_CAP_PROBE_TIMEOUT)
                 resp = b""
                 try:
                     while not resp.endswith(b"\n"):
@@ -208,12 +212,22 @@ class S2SLink:
         return "plain"
 
     def send_json(self, host, data, timeout=config.S2S_IO_TIMEOUT, wait_response=True):
-        if not host:
+        from dmcd.s2s_identity import is_allowed_s2s_host
+
+        if not host or not is_allowed_s2s_host(host):
+            return None
+        if not isinstance(data, dict):
+            return None
+        if self.identity is not None and getattr(self.identity, "enabled", False):
+            data = self.identity.sign(data)
+        elif config.S2S_REQUIRE_SIGNATURE:
             return None
         msg_id = data.get("msg_id")
         if msg_id and data.get("type") != "dialback_check":
             self.outbound.record(msg_id, data)
         mode = self.probe_cap(host, timeout=min(timeout, config.S2S_CONNECT_TIMEOUT))
+        if mode is None:
+            return None
         if mode == "encrypted":
             try:
                 return self._encrypted_send(host, data, timeout, wait_response)
@@ -223,6 +237,8 @@ class S2SLink:
                     return self._encrypted_send(host, data, timeout, wait_response)
                 except Exception:
                     self._cap_set(host, "plain")
+        if config.S2S_REQUIRE_ENCRYPTED:
+            return None
         return self._plain_send(host, data, timeout, wait_response)
 
     def handle_inbound(self, sock, process_fn):
@@ -270,7 +286,9 @@ class DialbackChecker:
             if not item:
                 return None
             ts, result = item
-            if time.time() - ts > config.DIALBACK_CACHE_TTL:
+            # Negative cache only; keep it short so transient failures recover.
+            ttl = min(config.DIALBACK_CACHE_TTL, 30.0)
+            if time.time() - ts > ttl:
                 del self._cache[key]
                 return None
             return result
@@ -280,12 +298,17 @@ class DialbackChecker:
             self._cache[f"{host}:{msg_type}"] = (time.time(), result)
 
     def check(self, from_host: str, msg_id: str, msg_type: str, **kwargs) -> bool:
-        """Ask from_host whether it really sent msg_id. Returns True on verified."""
+        """Ask from_host whether it really sent msg_id. Returns True on verified.
+
+        Positive results are intentionally NOT cached as authorization:
+        one successful dialback must not allow further spoofed messages
+        from that host. Only negative results are cached (fail-fast).
+        """
         if not from_host or not msg_id:
             return False
         cached = self.cached(from_host, msg_type)
-        if cached is True:
-            return True
+        if cached is False:
+            return False
 
         def _send():
             data = {
@@ -313,6 +336,6 @@ class DialbackChecker:
                         break
                 except Exception:
                     break
-        if result:
-            self.cache(from_host, msg_type, True)
+        if not result:
+            self.cache(from_host, msg_type, False)
         return result

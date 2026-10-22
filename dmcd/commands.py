@@ -1,7 +1,6 @@
 """Chat command handlers (everything after login)."""
 
 import re
-import threading
 
 from dmcd import config
 from dmcd import crypto
@@ -13,6 +12,7 @@ from dmcd.rooms import (
 )
 from dmcd.sessions import send_to_client
 from dmcd.s2s import generate_msg_id, log_message
+from dmcd.sanitize import sanitize_room_name, sanitize_text
 
 
 COMMANDS = {
@@ -58,7 +58,7 @@ def is_at_command(text: str) -> bool:
 
 
 def get_safe_server_path(server_name: str) -> str:
-    return server_name.replace("/", "_").replace("\\", "_").replace("\x00", "") or "server"
+    return sanitize_room_name(server_name) or "server"
 
 
 class CommandContext:
@@ -122,6 +122,9 @@ def handle_chat_message(message: str, ctx: CommandContext) -> None:
         return
     if a.bans.is_banned(ctx.username):
         return
+    message = sanitize_text(message)
+    if not message:
+        return
     room_name, host_part = ctx.room_name_and_host()
     if host_part and host_part != config.MY_SERVER_HOST:
         _echo_room_event(ctx, "message", ctx.username, config.MY_SERVER_HOST, {"text": message})
@@ -147,11 +150,10 @@ def handle_chat_message(message: str, ctx: CommandContext) -> None:
                 a.messages.save_message(room_name, ctx.username, message, config.MY_SERVER_HOST)
             except Exception as e:
                 log_message(f"Failed to save message to history: {e}")
-        threading.Thread(
-            target=_send_room_event_to_remotes,
-            args=(a, room_name, "message", ctx.username, config.MY_SERVER_HOST, {"text": message}),
-            daemon=True,
-        ).start()
+        a.task_pool.submit_thread(
+            _send_room_event_to_remotes,
+            a, room_name, "message", ctx.username, config.MY_SERVER_HOST, {"text": message},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +177,7 @@ def _cmd_delete_server(message, ctx):
     if len(parts) != 2:
         ctx.reply("Usage: /delete_server <server_name>")
         return
-    server_name = parts[1]
+    server_name = get_safe_server_path(parts[1])
     if server_name == config.DEFAULT_SERVER:
         ctx.reply(f"You cannot delete the default server '{config.DEFAULT_SERVER}'.")
         return
@@ -229,11 +231,10 @@ def _cmd_join_server(message, ctx):
             join_text, user_server, sender=ctx.username, filter_fn=a.should_filter_message
         )
         try:
-            threading.Thread(
-                target=_send_room_event_to_remotes,
-                args=(a, local_room, "joined", ctx.username, config.MY_SERVER_HOST, None),
-                daemon=True,
-            ).start()
+            a.task_pool.submit_thread(
+                _send_room_event_to_remotes,
+                a, local_room, "joined", ctx.username, config.MY_SERVER_HOST, None,
+            )
         except Exception:
             pass
     ctx.reply(f"Joined server '{local_room}' successfully.")
@@ -292,8 +293,12 @@ def _cmd_act(message, ctx):
         else:
             ctx.reply("Usage: /act <act>")
         return
-    act_name = parts[1]
-    if act_name in ("has joined the server.", "has left the server."):
+    act_name = sanitize_text(parts[1])
+    if not act_name:
+        ctx.reply("Usage: /act <act>")
+        return
+    lowered = act_name.lower()
+    if "has joined the server" in lowered or "has left the server" in lowered:
         ctx.reply("This action is not allowed.")
         return
     if not ctx.user_server:
@@ -320,11 +325,10 @@ def _cmd_act(message, ctx):
             filter_fn=a.should_filter_message,
         )
         try:
-            threading.Thread(
-                target=_send_room_event_to_remotes,
-                args=(a, room_name, "act", ctx.username, config.MY_SERVER_HOST, {"act": act_name}),
-                daemon=True,
-            ).start()
+            a.task_pool.submit_thread(
+                _send_room_event_to_remotes,
+                a, room_name, "act", ctx.username, config.MY_SERVER_HOST, {"act": act_name},
+            )
         except Exception:
             pass
 
@@ -336,17 +340,20 @@ def _cmd_pm(message, ctx):
         ctx.reply("Usage: /pm <username> <message>")
         return
     _, recipient, private_message = parts
+    private_message = sanitize_text(private_message)
+    if not private_message:
+        ctx.reply("Usage: /pm <username> <message>")
+        return
     m = re.match(r"^([\w\-]+)@([\w.\-]+)$", recipient)
     if m:
         remote_user, remote_host = m.group(1), m.group(2)
         if remote_host == config.MY_SERVER_HOST:
             recipient = remote_user
         else:
-            threading.Thread(
-                target=_handle_remote_pm,
-                args=(a, ctx, remote_user, remote_host, private_message, recipient),
-                daemon=True,
-            ).start()
+            a.task_pool.submit_thread(
+                _handle_remote_pm,
+                a, ctx, remote_user, remote_host, private_message, recipient,
+            )
             return
 
     if not a.users.exists(recipient):
@@ -429,9 +436,7 @@ def _echo_room_event(ctx, event, username, origin_host, payload=None):
 
 
 def _send_remote_room_async(a, host, room, payload):
-    threading.Thread(
-        target=_send_remote_room_sync, args=(a, host, payload), daemon=True
-    ).start()
+    a.task_pool.submit_thread(_send_remote_room_sync, a, host, payload)
 
 
 def _send_remote_room_sync(a, host, data):
@@ -550,11 +555,9 @@ def _kick_user(a, identifier):
                     text = format_room_event_text(config.MY_SERVER_HOST, "left", user, origin_host)
                     broadcast_message(text, room_name, sender=user, filter_fn=a.should_filter_message)
                     try:
-                        threading.Thread(
-                            target=_send_room_event_to_remotes,
-                            args=(a, room_name, "left", user, origin_host, None),
-                            daemon=True,
-                        ).start()
+                        a.task_pool.submit_thread(
+                            _send_room_event_to_remotes, a, room_name, "left", user, origin_host, None
+                        )
                     except Exception:
                         pass
                 break
@@ -569,11 +572,9 @@ def kick_remote_host(a, host):
             text = format_room_event_text(config.MY_SERVER_HOST, "left", username, origin_host)
             broadcast_message(text, room_name, sender=username, filter_fn=a.should_filter_message)
             try:
-                threading.Thread(
-                    target=_send_room_event_to_remotes,
-                    args=(a, room_name, "left", username, origin_host, None),
-                    daemon=True,
-                ).start()
+                a.task_pool.submit_thread(
+                    _send_room_event_to_remotes, a, room_name, "left", username, origin_host, None
+                )
             except Exception:
                 pass
 

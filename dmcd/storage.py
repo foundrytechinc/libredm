@@ -104,7 +104,9 @@ class RoomStore:
                     self._rooms[name] = []
 
     def _persist(self, name: str):
-        path = os.path.join(self.dir, f"{name}.json")
+        path = self._path_for(name)
+        if not path:
+            return
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self._rooms.get(name, []), f, ensure_ascii=False, indent=4)
@@ -122,9 +124,25 @@ class RoomStore:
         with self._lock:
             return list(self._rooms.get(name, []))
 
+    def _path_for(self, name: str):
+        safe = name.replace("/", "_").replace("\\", "_").replace("\x00", "").replace("..", "_")
+        if not safe or safe.strip("."):
+            pass
+        else:
+            return None
+        path = os.path.join(self.dir, f"{safe}.json")
+        real_dir = os.path.realpath(self.dir)
+        real_path = os.path.realpath(path)
+        if real_path != real_dir and not real_path.startswith(real_dir + os.sep):
+            return None
+        return path
+
     def create(self, name: str):
         with self._lock:
             if name in self._rooms:
+                return False
+            path = self._path_for(name)
+            if not path:
                 return False
             self._rooms[name] = []
             self._persist(name)
@@ -135,8 +153,8 @@ class RoomStore:
             if name not in self._rooms:
                 return False
             del self._rooms[name]
-            path = os.path.join(self.dir, f"{name}.json")
-            if os.path.exists(path):
+            path = self._path_for(name)
+            if path and os.path.exists(path):
                 try:
                     os.remove(path)
                 except Exception:

@@ -26,23 +26,31 @@ ENV/
 env/
 .venv
 
-# IDE
+# IDE / agent
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 .DS_Store
+.mimocode/
 
-# LibreDM data files
+# LibreDM runtime data (never commit)
 users.json
 bans.json
 servers/
 upload_tokens.json
 uploads/
+ignores.json
+status_subs.json
+status_remote_subs.json
+s2s_identity.pem
+s2s_trusted_hosts.json
 *.db
 *.db-shm
 *.db-wal
+*.pem
+!docs/**/*.pem
 
 # Logs
 *.log
@@ -51,5 +59,10 @@ uploads/
 backup-*.tar.gz
 backups/
 
-# Test data
+# Pytest
+.pytest_cache/
 test_data/
+
+# Nested repos / submodules accidentally created by tools
+.DS_Store
+

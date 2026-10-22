@@ -1,5 +1,7 @@
 """Storage backend factory."""
 
+import os
+
 from . import config
 
 
@@ -16,10 +18,10 @@ def create_stores():
         from .storage import UserStore, BanStore, RoomStore, TokenStore
 
         return {
-            "users": UserStore(config.USERS_FILE),
-            "bans": BanStore(config.BANS_FILE),
-            "rooms": RoomStore(config.SERVERS_DIR),
-            "tokens": TokenStore(config.UPLOAD_TOKENS_FILE),
+            "users": UserStore(config.data_path(config.USERS_FILE)),
+            "bans": BanStore(config.data_path(config.BANS_FILE)),
+            "rooms": RoomStore(config.data_path(config.SERVERS_DIR)),
+            "tokens": TokenStore(config.data_path(config.UPLOAD_TOKENS_FILE)),
             "messages": None,  # JSON backend doesn't support message history
             "db": None,  # No direct DB access for JSON
         }
@@ -35,7 +37,7 @@ def create_stores():
         )
 
         # Initialize schema if needed
-        db_path = config.DATABASE_FILE
+        db_path = config.data_path(config.DATABASE_FILE)
         _init_sqlite_schema(db_path)
 
         conn_pool = SQLiteConnection(db_path)

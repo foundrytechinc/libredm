@@ -11,12 +11,47 @@ from dmcd.client import handle_client, S2S_INBOUND_TYPES
 from dmcd.s2s import log_message
 
 
-def _maybe_wrap_tls(server_socket):
+_tls_ctx = None
+_tls_ctx_lock = threading.Lock()
+
+
+def _get_tls_context():
+    global _tls_ctx
     if not config.TLS_CERTFILE or not config.TLS_KEYFILE:
-        return server_socket
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(config.TLS_CERTFILE, config.TLS_KEYFILE)
-    return ctx.wrap_socket(server_socket, server_side=True)
+        return None
+    with _tls_ctx_lock:
+        if _tls_ctx is None:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx.load_cert_chain(config.TLS_CERTFILE, config.TLS_KEYFILE)
+            _tls_ctx = ctx
+        return _tls_ctx
+
+
+def _looks_like_tls(peek: bytes) -> bool:
+    # TLS record: content_type=0x16 (handshake), version 0x03 0x00..0x04
+    return (
+        len(peek) >= 3
+        and peek[0] == 0x16
+        and peek[1] == 0x03
+        and peek[2] <= 0x04
+    )
+
+
+def _maybe_wrap_tls(client_socket, peek: bytes = b""):
+    """Upgrade to TLS when configured and the peer speaks TLS.
+
+    Keeps the multi-protocol port usable for plain clients (Telnet, HTTP
+    upload, S2S) while allowing TLS clients on the same port.
+    """
+    ctx = _get_tls_context()
+    if ctx is None or not _looks_like_tls(peek):
+        return client_socket
+    try:
+        return ctx.wrap_socket(client_socket, server_side=True)
+    except Exception as e:
+        log_message(f"TLS handshake failed: {e}")
+        raise
 
 
 def _build_listener(host, port):
@@ -27,7 +62,8 @@ def _build_listener(host, port):
     return server_socket
 
 
-def start_key_exchange_server(a, host="0.0.0.0", port=None):
+def start_key_exchange_server(a, host=None, port=None):
+    host = config.BIND_HOST if host is None else host
     port = port or config.ENCRYPTED_PORT
     server_socket = _build_listener(host, port)
     log_message(f"TCP encrypted server started on {host}:{port}")
@@ -54,7 +90,7 @@ def start_key_exchange_server(a, host="0.0.0.0", port=None):
 def _handle_encrypted_client(client_socket, client_address, a):
     try:
         try:
-            client_socket.settimeout(2.0)
+            client_socket.settimeout(config.TLS_PEEK_TIMEOUT)
             peek = b""
             try:
                 peek = client_socket.recv(1024, socket.MSG_PEEK)
@@ -65,6 +101,19 @@ def _handle_encrypted_client(client_socket, client_address, a):
                     client_socket.settimeout(None)
                 except Exception:
                     pass
+
+            if peek and _looks_like_tls(peek):
+                client_socket = _maybe_wrap_tls(client_socket, peek)
+                try:
+                    client_socket.settimeout(config.PEEK_TIMEOUT)
+                    peek = client_socket.recv(1024, socket.MSG_PEEK)
+                except Exception:
+                    peek = b""
+                finally:
+                    try:
+                        client_socket.settimeout(None)
+                    except Exception:
+                        pass
 
             # Text / Telnet client accidentally on the encrypted port:
             # fall back to the plain protocol instead of failing DH.
@@ -114,7 +163,8 @@ def _looks_like_text_client(peek: bytes) -> bool:
     return False
 
 
-def start_tcp_server(a, host="0.0.0.0", port=None):
+def start_tcp_server(a, host=None, port=None):
+    host = config.BIND_HOST if host is None else host
     port = port or config.TCP_PORT
     server_socket = _build_listener(host, port)
     log_message(f"TCP server started on {host}:{port}")
@@ -141,7 +191,7 @@ def start_tcp_server(a, host="0.0.0.0", port=None):
 def _dispatch_connection(sock, addr, a):
     handled = False
     try:
-        sock.settimeout(0.5)
+        sock.settimeout(config.PEEK_TIMEOUT)
         try:
             peek = sock.recv(1024, socket.MSG_PEEK)
         except socket.timeout:
@@ -153,6 +203,19 @@ def _dispatch_connection(sock, addr, a):
                 sock.settimeout(None)
             except Exception:
                 pass
+
+        if peek and _looks_like_tls(peek):
+            sock = _maybe_wrap_tls(sock, peek)
+            try:
+                sock.settimeout(config.PEEK_TIMEOUT)
+                peek = sock.recv(1024, socket.MSG_PEEK)
+            except Exception:
+                peek = b""
+            finally:
+                try:
+                    sock.settimeout(None)
+                except Exception:
+                    pass
 
         # Raw capability handlers (e.g. HTTP file upload).
         if a.capabilities_manager is not None:
@@ -203,7 +266,7 @@ def _s2s_encrypted(msg, reply, sock, addr, a):
 
 def cleanup_tasks(a):
     while True:
-        time.sleep(60)
+        time.sleep(config.CLEANUP_INTERVAL_SECONDS)
         try:
             _run_cleanup(a)
         except Exception as e:
@@ -214,6 +277,13 @@ def _run_cleanup(a):
     from dmcd.commands import kick_remote_host
 
     now = time.time()
+
+    # Fold WAL into the main DB file so a restart/copy cannot lose commits.
+    if getattr(a, "db", None) is not None and hasattr(a.db, "checkpoint"):
+        try:
+            a.db.checkpoint()
+        except Exception:
+            pass
 
     # Sweep stale dialback cache entries (checker-side cache).
     with a.dialback._lock:
@@ -290,7 +360,7 @@ def _check_remote_users_online(a, host, usernames):
                 "usernames": list(usernames),
                 "from_host": a.get_advertised_host(),
             },
-            timeout=5,
+            timeout=config.REMOTE_STATUS_TIMEOUT,
         )
         if not isinstance(out, dict) or out.get("status") != "ok":
             return {u: False for u in usernames}

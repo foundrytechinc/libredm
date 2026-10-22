@@ -21,14 +21,30 @@ try:
 except Exception:
     _native = None
 
-# RFC 5114 1024-bit MODP Group (same group as the original protocol)
-DH_P = int(
+# RFC 3526 2048-bit MODP Group 14 (safe prime) — default.
+# Legacy value kept byte-identical to the original protocol for old clients.
+_DH_P_LEGACY = int(
     "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
     "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
     "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
     "E485B576625E7EC6F44C42E9A63A3620FFFFFFFFFFFFFFFF",
     16,
 )
+_DH_P_2048 = int(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
+    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
+    "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D"
+    "C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F"
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D"
+    "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B"
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9"
+    "DE2BCBF6955817183995497CEA956AE515D2261898FA0510"
+    "15728E5A8AACAA68FFFFFFFFFFFFFFFF",
+    16,
+)
+DH_P = _DH_P_LEGACY if getattr(config, "LEGACY_DH_1024", False) else _DH_P_2048
 DH_G = 2
 
 
@@ -69,30 +85,51 @@ def _verify_pbkdf2(password: str, stored: str) -> bool:
         return False
 
 
-def _verify_legacy(password: str, stored: str) -> bool:
-    """Verify against legacy plain / md5 / sha256 / sha512 / base64 forms.
-
-    Only used to migrate old users.json entries. On success the caller should
-    re-hash with hash_password().
-    """
-    if stored == password:
-        return True
-    # md5
-    if len(stored) == 32 and re.fullmatch(r"[a-fA-F0-9]{32}", stored):
-        return hmac.compare_digest(
-            hashlib.md5(password.encode("utf-8")).hexdigest().lower(), stored.lower()
-        )
-    # sha256
-    if len(stored) == 64 and re.fullmatch(r"[a-fA-F0-9]{64}", stored):
-        return hmac.compare_digest(
-            hashlib.sha256(password.encode("utf-8")).hexdigest().lower(), stored.lower()
-        )
-    # sha512
-    if len(stored) == 128 and re.fullmatch(r"[a-fA-F0-9]{128}", stored):
-        return hmac.compare_digest(
-            hashlib.sha512(password.encode("utf-8")).hexdigest().lower(), stored.lower()
-        )
+def _legacy_digest_ok(password: str, stored: str, algo: str, digest_fn) -> bool:
+    """Constant-time compare of an unsalted hex digest. Migration only."""
+    try:
+        if len(stored) == algo and re.fullmatch(r"[a-fA-F0-9]+", stored):
+            expected = digest_fn(password.encode("utf-8")).hexdigest().lower()
+            return hmac.compare_digest(expected, stored.lower())
+    except Exception:
+        return False
     return False
+
+
+def _verify_legacy(password: str, stored: str) -> bool:
+    """Verify against legacy unsalted md5/sha256/sha512 hex digests.
+
+    Used only to migrate old users.json / DB rows. On success the caller
+    re-hashes with hash_password(). Plaintext equality is not accepted.
+
+    Original DMCD also had `stored == password` and base64 tricks
+    (see 111.py authenticate_user); those are intentionally gone.
+    """
+    if not config.ALLOW_LEGACY_PASSWORD_HASHES:
+        return False
+    # md5 (32 hex)
+    if _legacy_digest_ok(password, stored, 32, hashlib.md5):
+        return True
+    # sha256 (64 hex)
+    if _legacy_digest_ok(password, stored, 64, hashlib.sha256):
+        return True
+    # sha512 (128 hex)
+    if _legacy_digest_ok(password, stored, 128, hashlib.sha512):
+        return True
+    return False
+
+
+def looks_like_legacy_hash(stored: str) -> bool:
+    if not isinstance(stored, str) or not stored or stored.startswith("pbkdf2_sha256$"):
+        return False
+    return bool(re.fullmatch(r"[a-fA-F0-9]{32}|[a-fA-F0-9]{64}|[a-fA-F0-9]{128}", stored))
+
+
+def looks_like_plaintext_password(stored: str) -> bool:
+    """Stored value is not a recognized hash — old DMCD plaintext."""
+    if not isinstance(stored, str) or not stored or stored.startswith("pbkdf2_sha256$"):
+        return False
+    return not looks_like_legacy_hash(stored)
 
 
 def verify_password(password: str, stored: str) -> bool:
@@ -100,6 +137,9 @@ def verify_password(password: str, stored: str) -> bool:
         return False
     if stored.startswith("pbkdf2_sha256$"):
         return _verify_pbkdf2(password, stored)
+    if config.ALLOW_LEGACY_PLAINTEXT_PASSWORDS and stored == password:
+        # Explicit opt-in only (legacy DMCD compatibility). Off by default.
+        return True
     return _verify_legacy(password, stored)
 
 
@@ -112,6 +152,8 @@ def needs_rehash(stored: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def derive_session_keys(shared_bytes: bytes):
+    if _native is not None:
+        return _native.derive_session_keys(shared_bytes)
     enc_key = hashlib.sha256(shared_bytes + b"|KEY").digest()
     mac_key = hashlib.sha256(shared_bytes + b"|MAC").digest()
     return enc_key, mac_key
@@ -206,25 +248,48 @@ def _recv_exact(sock, n: int):
 # Diffie-Hellman
 # ---------------------------------------------------------------------------
 
+def _dh_modp_bytes() -> bytes:
+    length = (DH_P.bit_length() + 7) // 8
+    return DH_P.to_bytes(length, "big")
+
+
 class DHContext:
     """One side of a DH exchange."""
 
     def __init__(self):
-        self._priv = int.from_bytes(get_random_bytes(32), "big")
+        # 256-bit private exponent is standard and matches the group size class.
+        nbytes = getattr(config, "DH_PRIV_BYTES", 32)
+        self._priv = int.from_bytes(get_random_bytes(nbytes), "big") or 1
+        self._priv_bytes = self._priv.to_bytes(nbytes, "big")
+        self._modp = _dh_modp_bytes()
 
     def public_bytes(self) -> bytes:
+        if _native is not None:
+            return _native.dh_public(self._priv_bytes, self._modp)
         val = pow(DH_G, self._priv, DH_P)
         length = (DH_P.bit_length() + 7) // 8
         raw = val.to_bytes(length, "big").lstrip(b"\x00") or b"\x00"
         return raw
 
     def shared_secret(self, peer_public_bytes: bytes) -> bytes:
+        if _native is not None:
+            _native.dh_validate_public(peer_public_bytes, self._modp)
+            return _native.dh_shared(self._priv_bytes, peer_public_bytes, self._modp)
         peer = int.from_bytes(peer_public_bytes, "big")
-        # Match original: no subgroup checks, same serialization.
+        _validate_peer_public(peer)
         shared = pow(peer, self._priv, DH_P)
         length = (DH_P.bit_length() + 7) // 8
         raw = shared.to_bytes(length, "big")
         return raw.lstrip(b"\x00") or b"\x00"
+
+
+def _validate_peer_public(peer: int) -> None:
+    """Reject trivial and small-subgroup DH public values."""
+    if peer <= 1 or peer >= DH_P - 1:
+        raise ValueError("DH public value out of range")
+    # Safe-prime subgroup check: y^q ≡ 1 (mod P) for q = (P-1)/2.
+    if pow(peer, (DH_P - 1) // 2, DH_P) != 1:
+        raise ValueError("DH public value not in prime-order subgroup")
 
 
 def dh_send_public(sock, public_bytes: bytes):

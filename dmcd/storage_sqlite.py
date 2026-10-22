@@ -20,7 +20,15 @@ class SQLiteConnection:
             # Enable WAL mode for concurrent reads
             self._local.conn.execute("PRAGMA journal_mode=WAL")
             self._local.conn.execute("PRAGMA foreign_keys=ON")
+            self._local.conn.execute("PRAGMA synchronous=NORMAL")
         return self._local.conn
+
+    def checkpoint(self):
+        """Fold WAL into the main database file (durability)."""
+        try:
+            self.get().execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
 
 
 class SQLiteUserStore:

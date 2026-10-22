@@ -14,15 +14,18 @@ import uuid
 
 from caps.caps import Capability
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+
+def _upload_dir():
+    from dmcd import config
+    return config.data_path(config.UPLOAD_DIR)
+
 
 _cleanup_started = False
 _cleanup_lock = threading.Lock()
 
 
 def _ensure_uploads():
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    os.makedirs(_upload_dir(), exist_ok=True)
 
 
 def _start_cleanup_once():
@@ -36,9 +39,10 @@ def _start_cleanup_once():
             while True:
                 from dmcd import config
                 cutoff = time.time() - config.UPLOAD_TTL_SECONDS
+                base = _upload_dir()
                 try:
-                    for entry in os.listdir(UPLOAD_DIR):
-                        full = os.path.join(UPLOAD_DIR, entry)
+                    for entry in os.listdir(base):
+                        full = os.path.join(base, entry)
                         try:
                             if os.path.getmtime(full) < cutoff:
                                 if os.path.isdir(full):
@@ -49,7 +53,7 @@ def _start_cleanup_once():
                             pass
                 except Exception:
                     pass
-                time.sleep(60)
+                time.sleep(config.CLEANUP_INTERVAL_SECONDS)
 
         threading.Thread(target=_worker, daemon=True).start()
         _cleanup_started = True
@@ -57,13 +61,26 @@ def _start_cleanup_once():
 
 def _safe_filename(name):
     allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
-    return "".join(ch for ch in name if ch in allowed) or "file"
+    cleaned = "".join(ch for ch in name if ch in allowed)
+    # Reject traversal / empty after cleanup ("..", ".", "").
+    if cleaned.strip(".") == "":
+        return "file"
+    return cleaned
+
+
+def _safe_join_upload(*parts):
+    """Join under the upload dir and ensure the result stays inside it."""
+    base = os.path.realpath(_upload_dir())
+    path = os.path.realpath(os.path.join(base, *parts))
+    if path != base and not path.startswith(base + os.sep):
+        return None
+    return path
 
 
 def _http_response(sock, code, headers, body):
     reason = {
         200: "OK", 400: "Bad Request", 401: "Unauthorized",
-        404: "Not Found", 500: "Internal Server Error",
+        404: "Not Found", 413: "Payload Too Large", 500: "Internal Server Error",
     }.get(code, "OK")
     head = f"HTTP/1.1 {code} {reason}\r\n".encode("utf-8")
     for k, v in headers.items():
@@ -78,15 +95,28 @@ def _http_response(sock, code, headers, body):
 
 
 def _extract_token(headers, path):
+    # Bearer only. Tokens in the query string leak via logs/Referer/history.
     auth = headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
-    if "token=" in path:
-        try:
-            return path.split("token=", 1)[1].split("&", 1)[0]
-        except Exception:
-            return None
     return None
+
+
+# Served back to browsers — never let these execute as active content.
+_DANGEROUS_EXTS = frozenset({
+    ".html", ".htm", ".xhtml", ".svg", ".xml", ".xsl", ".xslt",
+    ".js", ".mjs", ".css", ".pdf", ".swf", ".php", ".shtml",
+})
+
+
+def _safe_download_mime(filename):
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in _DANGEROUS_EXTS:
+        return "application/octet-stream"
+    mime, _ = mimetypes.guess_type(filename)
+    if not mime or mime.startswith("text/") or "javascript" in mime or "xml" in mime:
+        return "application/octet-stream"
+    return mime
 
 
 class HttpFileUploadCapability(Capability):
@@ -144,6 +174,10 @@ class HttpFileUploadCapability(Capability):
                 cl = int(headers.get("content-length", "0") or "0")
             except Exception:
                 cl = 0
+            # Reject oversized bodies before reading them into memory.
+            if cl < 0 or (0 < config.MAX_UPLOAD_SIZE_BYTES < cl):
+                _http_response(client_socket, 413, {"Content-Length": "0", "Connection": "close"}, b"")
+                return
             missing = max(0, cl - len(body))
             while missing > 0:
                 chunk = client_socket.recv(min(65536, missing))
@@ -151,6 +185,9 @@ class HttpFileUploadCapability(Capability):
                     break
                 body += chunk
                 missing -= len(chunk)
+            if len(body) > config.MAX_UPLOAD_SIZE_BYTES > 0:
+                _http_response(client_socket, 413, {"Content-Length": "0", "Connection": "close"}, b"")
+                return
 
             if method == "POST" and path.startswith("/upload"):
                 self._handle_upload(client_socket, headers, body, path)
@@ -244,7 +281,10 @@ class HttpFileUploadCapability(Capability):
                     _http_response(sock, 400, {"Content-Length": "0", "Connection": "close"}, b"")
                     break
                 file_id = uuid.uuid4().hex
-                target_dir = os.path.join(UPLOAD_DIR, file_id)
+                target_dir = _safe_join_upload(file_id)
+                if not target_dir:
+                    _http_response(sock, 500, {"Content-Length": "0", "Connection": "close"}, b"")
+                    break
                 try:
                     os.makedirs(target_dir, exist_ok=True)
                     with open(os.path.join(target_dir, filename), "wb") as f:
@@ -287,19 +327,19 @@ class HttpFileUploadCapability(Capability):
             return
         file_id = _safe_filename(parts[2])
         filename = _safe_filename(parts[3])
-        full_path = os.path.join(UPLOAD_DIR, file_id, filename)
-        if not os.path.isfile(full_path):
+        full_path = _safe_join_upload(file_id, filename)
+        if not full_path or not os.path.isfile(full_path):
             _http_response(sock, 404, {"Content-Length": "0", "Connection": "close"}, b"")
             return
-        mime, _ = mimetypes.guess_type(filename)
-        if not mime:
-            mime = "application/octet-stream"
+        mime = _safe_download_mime(filename)
         try:
             size = os.path.getsize(full_path)
             headers = {
                 "Content-Type": mime,
                 "Content-Length": str(size),
                 "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "default-src 'none'; sandbox",
                 "Connection": "close",
             }
             _http_response(sock, 200, headers, b"")

@@ -10,14 +10,20 @@ from caps.caps import Capability
 _state_lock = threading.RLock()
 _app = None  # bound at startup via bind_app()
 
-_subs_file = "status_subs.json"
+
+def _subs_path():
+    from dmcd import config
+    return config.data_path(config.STATUS_SUBS_FILE)
+
+
+def _remote_subs_path():
+    from dmcd import config
+    return config.data_path(config.STATUS_REMOTE_SUBS_FILE)
+
+
 _subscriptions = None
 _last_state = {}
 
-_REMOTE_SUBS_FILE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "status_remote_subs.json",
-)
 _remote_subs = None
 
 _REMOTE_CHECK_TIMEOUT = 5
@@ -47,9 +53,10 @@ def _load_subscriptions():
         if _subscriptions is not None:
             return
         subs = {}
+        path = _subs_path()
         try:
-            if os.path.exists(_subs_file):
-                with open(_subs_file, "r", encoding="utf-8") as f:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if isinstance(data, dict):
                     for subscriber, targets in data.items():
@@ -66,10 +73,11 @@ def _save_subscriptions():
             return
         data = {k: sorted(list(v)) for k, v in _subscriptions.items() if v}
     try:
-        tmp = _subs_file + ".tmp"
+        path = _subs_path()
+        tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
-        os.replace(tmp, _subs_file)
+        os.replace(tmp, path)
     except Exception:
         pass
 
@@ -80,9 +88,10 @@ def _load_remote_subs():
         if _remote_subs is not None:
             return
         out = {}
+        path = _remote_subs_path()
         try:
-            if os.path.exists(_REMOTE_SUBS_FILE):
-                with open(_REMOTE_SUBS_FILE, "r", encoding="utf-8") as f:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
                     raw = json.load(f)
                 if isinstance(raw, dict):
                     for local_user, by_host in raw.items():
@@ -107,10 +116,11 @@ def _save_remote_subs():
                 continue
             data[local_user] = {h: sorted(list(us)) for h, us in by_host.items() if us}
     try:
-        tmp = _REMOTE_SUBS_FILE + ".tmp"
+        path = _remote_subs_path()
+        tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
-        os.replace(tmp, _REMOTE_SUBS_FILE)
+        os.replace(tmp, path)
     except Exception:
         pass
 

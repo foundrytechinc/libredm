@@ -16,6 +16,11 @@ from dmcd.commands import (
 from dmcd.sessions import Session, send_to_client
 from dmcd.textstream import TextStream
 from dmcd.s2s import log_message
+from dmcd.sanitize import (
+    is_reserved_username,
+    sanitize_text,
+    sanitize_username,
+)
 
 
 def sanitize_command(command: str) -> str:
@@ -25,6 +30,16 @@ def sanitize_command(command: str) -> str:
         # /login username password → /login username [REDACTED]
         return f"{parts[0]} {parts[1]} [REDACTED]"
     return command
+
+
+def _is_encrypted_connection(client_socket, client_key) -> bool:
+    if client_key is not None:
+        return True
+    try:
+        import ssl
+        return isinstance(client_socket, ssl.SSLSocket)
+    except Exception:
+        return False
 
 
 
@@ -43,7 +58,10 @@ def receive_from_client(client_socket, client_key=None, text_in=None):
                 enc_key, mac_key = client_key
             else:
                 enc_key, mac_key = client_key, None
-            return crypto.receive_encrypted(client_socket, enc_key, mac_key)
+            line = crypto.receive_encrypted(client_socket, enc_key, mac_key)
+            if isinstance(line, str) and len(line) > config.MAX_MESSAGE_LENGTH + 128:
+                return line[: config.MAX_MESSAGE_LENGTH + 128]
+            return line
         if text_in is None:
             text_in = TextStream()
         while True:
@@ -79,7 +97,7 @@ def handle_client(client_socket, client_address, a, client_key=None):
 
     if not use_encryption and text_in:
         try:
-            client_socket.settimeout(0.3)
+            client_socket.settimeout(config.PEEK_TIMEOUT)
             peek = client_socket.recv(config.MAX_PACKET_SIZE, socket.MSG_PEEK)
             if peek:
                 if config.CTRL_ESC in peek:
@@ -160,6 +178,16 @@ def try_plain_s2s(client_socket, client_address, a, peek: bytes) -> bool:
         return False
     if not (isinstance(msg, dict) and msg.get("type") in S2S_INBOUND_TYPES):
         return False
+    # Cleartext S2S is only kept for capability discovery when encryption
+    # is mandatory — all other types must arrive on the encrypted transport.
+    if config.S2S_REQUIRE_ENCRYPTED and msg.get("type") != "s2s_cap":
+        try:
+            client_socket.send(
+                (json.dumps({"status": "error", "reason": "encryption_required"}, ensure_ascii=False) + "\n").encode("utf-8")
+            )
+        except Exception:
+            pass
+        return True
     try:
         data = client_socket.recv(config.MAX_PACKET_SIZE)
         msg = json.loads(data.decode("utf-8").strip())
@@ -181,7 +209,7 @@ def try_plain_s2s(client_socket, client_address, a, peek: bytes) -> bool:
 
 def _drain_stashed(client_socket, text_in):
     try:
-        client_socket.settimeout(0.15)
+        client_socket.settimeout(config.DRAIN_TIMEOUT)
         drain_end = time.time() + 2.0
         while time.time() < drain_end:
             try:
@@ -205,6 +233,14 @@ def _drain_stashed(client_socket, text_in):
 
 
 def _do_register(command, client_socket, client_key, a, client_ip) -> bool:
+    if config.REQUIRE_ENCRYPTED_AUTH and not _is_encrypted_connection(client_socket, client_key):
+        send_to_client(
+            client_socket,
+            "Registration requires an encrypted connection (TLS or the encrypted port). "
+            "Official DMConnect clients: set REQUIRE_ENCRYPTED_AUTH = False in dmcd/config.py.",
+            client_key,
+        )
+        return False
     if not a.register_limiter.allow(client_ip):
         send_to_client(client_socket, "Too many attempts. Try again later.", client_key)
         return False
@@ -213,12 +249,19 @@ def _do_register(command, client_socket, client_key, a, client_ip) -> bool:
         send_to_client(client_socket, "Usage: /register <username> <password>", client_key)
         return False
     _, username, password = parts
-    username = username.replace("@", "_")
-    if not username or len(username) > 64:
+    username = sanitize_username(username)
+    if not username:
         send_to_client(client_socket, "Invalid username.", client_key)
         return False
-    if len(password) < 4:
-        send_to_client(client_socket, "Password too short (min 4 characters).", client_key)
+    if is_reserved_username(username):
+        send_to_client(client_socket, "Username is reserved.", client_key)
+        return False
+    if len(password) < 8 or len(password) > config.MAX_PASSWORD_LENGTH:
+        send_to_client(
+            client_socket,
+            f"Password must be 8-{config.MAX_PASSWORD_LENGTH} characters.",
+            client_key,
+        )
         return False
     if a.users.register(username, password):
         send_to_client(client_socket, "Registration successful. Please log in.", client_key)
@@ -228,6 +271,14 @@ def _do_register(command, client_socket, client_key, a, client_ip) -> bool:
 
 
 def _do_login(command, client_socket, client_key, a, client_ip, session):
+    if config.REQUIRE_ENCRYPTED_AUTH and not _is_encrypted_connection(client_socket, client_key):
+        send_to_client(
+            client_socket,
+            "Login requires an encrypted connection (TLS or the encrypted port). "
+            "Official DMConnect clients: set REQUIRE_ENCRYPTED_AUTH = False in dmcd/config.py.",
+            client_key,
+        )
+        return None
     if not a.login_limiter.allow(client_ip):
         send_to_client(client_socket, "Too many attempts. Try again later.", client_key)
         return None
@@ -236,10 +287,32 @@ def _do_login(command, client_socket, client_key, a, client_ip, session):
         send_to_client(client_socket, "Usage: /login <username> <password>", client_key)
         return None
     _, username, password = parts
-    stored = a.users.get_hash(username)
-    if stored is None or not crypto.verify_password(password, stored):
+    username = sanitize_username(username) or username
+    if len(password) > config.MAX_PASSWORD_LENGTH:
         send_to_client(client_socket, "Invalid username or password.", client_key)
         return None
+    locked_for = a.login_lockout.is_locked(username)
+    if locked_for:
+        send_to_client(
+            client_socket,
+            f"Account temporarily locked. Try again in {int(locked_for) + 1}s.",
+            client_key,
+        )
+        return None
+    stored = a.users.get_hash(username)
+    if stored is None or not crypto.verify_password(password, stored):
+        left = a.login_lockout.record_failure(username)
+        if left:
+            send_to_client(
+                client_socket,
+                f"Invalid username or password. Account locked for {int(left) + 1}s.",
+                client_key,
+            )
+        else:
+            send_to_client(client_socket, "Invalid username or password.", client_key)
+        return None
+
+    a.login_lockout.clear(username)
 
     # Upgrade legacy hashes transparently on successful login.
     if crypto.needs_rehash(stored):
@@ -322,13 +395,11 @@ def _cleanup(a, session, client_address):
                         filter_fn=a.should_filter_message,
                     )
                     try:
-                        import threading
                         from dmcd.commands import _send_room_event_to_remotes
-                        threading.Thread(
-                            target=_send_room_event_to_remotes,
-                            args=(a, room_name, "left", session.username, config.MY_SERVER_HOST, None),
-                            daemon=True,
-                        ).start()
+                        a.task_pool.submit_thread(
+                            _send_room_event_to_remotes,
+                            a, room_name, "left", session.username, config.MY_SERVER_HOST, None,
+                        )
                     except Exception:
                         pass
             else:

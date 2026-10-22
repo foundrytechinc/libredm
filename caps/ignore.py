@@ -6,18 +6,22 @@ import threading
 
 from caps.caps import Capability
 
-_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ignores.json"
-)
+
+def _store_path():
+    from dmcd import config
+    return config.data_path(config.IGNORES_FILE)
+
+
 _lock = threading.RLock()
 
 
 def _load():
     with _lock:
-        if not os.path.exists(_PATH):
+        path = _store_path()
+        if not os.path.exists(path):
             return {}
         try:
-            with open(_PATH, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
             return {
                 u: list(v) if isinstance(v, list) else list(v.keys())
@@ -29,10 +33,11 @@ def _load():
 
 def _save(data):
     with _lock:
-        tmp = _PATH + ".tmp"
+        path = _store_path()
+        tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
-        os.replace(tmp, _PATH)
+        os.replace(tmp, path)
 
 
 def is_ignored(recipient_username, sender_username, context):

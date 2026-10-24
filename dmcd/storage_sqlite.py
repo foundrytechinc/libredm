@@ -55,17 +55,18 @@ class SQLiteUserStore:
         from dmcd.crypto import hash_password
 
         db = self.conn.get()
-        if self.exists(username):
-            return False
-
         password_hash = hash_password(password)
-        db.execute(
-            """INSERT INTO users (username, password_hash, created_at)
-               VALUES (?, ?, ?)""",
-            (username, password_hash, datetime.utcnow().isoformat()),
-        )
-        db.commit()
-        return True
+        try:
+            # Rely on PRIMARY KEY to close the check-then-insert race.
+            db.execute(
+                """INSERT INTO users (username, password_hash, created_at)
+                   VALUES (?, ?, ?)""",
+                (username, password_hash, datetime.utcnow().isoformat()),
+            )
+            db.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
 
     def set_hash(self, username, password_hash):
         db = self.conn.get()
@@ -304,15 +305,22 @@ class SQLiteMessageStore:
         ]
 
     def search_messages(self, room, keyword, limit=100):
-        """Search messages containing keyword."""
+        """Search messages containing keyword (literal, not LIKE wildcards)."""
+        # Escape LIKE metacharacters so user input is matched literally.
+        escaped = (
+            str(keyword)
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
         db = self.conn.get()
         cur = db.execute(
             """SELECT sender, origin_host, text, sent_at
                FROM messages
-               WHERE room = ? AND text LIKE ?
+               WHERE room = ? AND text LIKE ? ESCAPE '\\'
                ORDER BY sent_at DESC
                LIMIT ?""",
-            (room, f"%{keyword}%", limit),
+            (room, f"%{escaped}%", limit),
         )
         messages = cur.fetchall()
         return [

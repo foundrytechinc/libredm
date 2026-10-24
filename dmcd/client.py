@@ -24,12 +24,14 @@ from dmcd.sanitize import (
 
 
 def sanitize_command(command: str) -> str:
-    """Mask passwords in log output."""
+    """Mask passwords and strip control chars for safe log output."""
+    from dmcd.sanitize import strip_controls
     parts = command.split(None, 2)
     if len(parts) >= 3 and parts[0] in ("/login", "/register"):
         # /login username password → /login username [REDACTED]
-        return f"{parts[0]} {parts[1]} [REDACTED]"
-    return command
+        command = f"{parts[0]} {parts[1]} [REDACTED]"
+    # Neutralize CR/LF so a crafted command cannot forge log lines.
+    return strip_controls(command)[:512]
 
 
 def _is_encrypted_connection(client_socket, client_key) -> bool:
@@ -168,16 +170,50 @@ def handle_client(client_socket, client_address, a, client_key=None):
         _cleanup(a, session, client_address)
 
 
+def _recv_json_line(client_socket) -> dict:
+    """Read one newline-terminated JSON object (bounded)."""
+    buf = b""
+    while len(buf) < config.MAX_PACKET_SIZE and b"\n" not in buf:
+        chunk = client_socket.recv(min(4096, config.MAX_PACKET_SIZE - len(buf)))
+        if not chunk:
+            break
+        buf += chunk
+    line = buf.split(b"\n", 1)[0].strip()
+    if not line:
+        raise ValueError("empty s2s line")
+    msg = json.loads(line.decode("utf-8"))
+    if not isinstance(msg, dict):
+        raise ValueError("s2s message must be an object")
+    return msg
+
+
 def try_plain_s2s(client_socket, client_address, a, peek: bytes) -> bool:
     """Handle a plain JSON S2S message. Returns True if the socket was consumed."""
     if not peek:
         return False
+    # Peek is only a sniff: decide whether this *might* be plain S2S. The
+    # message that is actually processed must be re-read and re-validated —
+    # never trust the peeked bytes as the payload (TOCTOU).
     try:
-        msg = json.loads(peek.decode("utf-8").strip())
+        probed = json.loads(peek.decode("utf-8").strip())
     except Exception:
         return False
-    if not (isinstance(msg, dict) and msg.get("type") in S2S_INBOUND_TYPES):
+    if not (isinstance(probed, dict) and probed.get("type") in S2S_INBOUND_TYPES):
         return False
+
+    try:
+        msg = _recv_json_line(client_socket)
+    except Exception:
+        return True
+
+    if msg.get("type") not in S2S_INBOUND_TYPES:
+        try:
+            client_socket.send(
+                (json.dumps({"status": "error", "reason": "bad_request"}, ensure_ascii=False) + "\n").encode("utf-8")
+            )
+        except Exception:
+            pass
+        return True
     # Cleartext S2S is only kept for capability discovery when encryption
     # is mandatory — all other types must arrive on the encrypted transport.
     if config.S2S_REQUIRE_ENCRYPTED and msg.get("type") != "s2s_cap":
@@ -187,11 +223,6 @@ def try_plain_s2s(client_socket, client_address, a, peek: bytes) -> bool:
             )
         except Exception:
             pass
-        return True
-    try:
-        data = client_socket.recv(config.MAX_PACKET_SIZE)
-        msg = json.loads(data.decode("utf-8").strip())
-    except Exception:
         return True
 
     def _plain_reply(payload):
@@ -286,8 +317,20 @@ def _do_login(command, client_socket, client_key, a, client_ip, session):
     if len(parts) != 3:
         send_to_client(client_socket, "Usage: /login <username> <password>", client_key)
         return None
-    _, username, password = parts
-    username = sanitize_username(username) or username
+    _, username_raw, password = parts
+    username = sanitize_username(username_raw)
+    if not username:
+        # Legacy compatibility: accounts imported from old DMCD (users.json)
+        # may contain chars outside the strict set. Accept the input only if
+        # it exactly matches an existing account (after control-char strip) —
+        # otherwise reject. Never create/lookup free-form names.
+        from dmcd.sanitize import strip_controls
+        legacy = strip_controls(username_raw).strip()
+        if legacy and len(legacy) <= config.MAX_USERNAME_LENGTH and a.users.exists(legacy):
+            username = legacy
+    if not username:
+        send_to_client(client_socket, "Invalid username or password.", client_key)
+        return None
     if len(password) > config.MAX_PASSWORD_LENGTH:
         send_to_client(client_socket, "Invalid username or password.", client_key)
         return None
@@ -378,11 +421,8 @@ def _cleanup(a, session, client_address):
                 pass
 
         if session.server_name:
-            room_name, host_part = (
-                session.server_name.split("@", 1)
-                if "@" in session.server_name
-                else (session.server_name, None)
-            )
+            from dmcd.rooms import parse_room_and_host
+            room_name, host_part = parse_room_and_host(session.server_name)
             if host_part is None:
                 was_last = a.rooms.remove_member(room_name, session.username, config.MY_SERVER_HOST)
                 if was_last:

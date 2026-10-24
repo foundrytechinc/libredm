@@ -368,8 +368,6 @@ def _cmd_pm(message, ctx):
         return
 
     result = _send_private_message(a, ctx.username, recipient, private_message)
-    if not result:
-        _kick_user(a, recipient)
     if result:
         ctx.reply(f"Private message sent to {recipient}.")
     else:
@@ -440,12 +438,14 @@ def _send_remote_room_async(a, host, room, payload):
 
 
 def _send_remote_room_sync(a, host, data):
+    data = dict(data)
     if "msg_id" not in data:
-        data = dict(data)
         data["msg_id"] = generate_msg_id(
             data.get("sender", ""), data.get("room", ""), data.get("type", "")
         )
-        data.setdefault("from_host", a.get_advertised_host())
+    # from_host is mandatory for inbound validation/dialback — set it even
+    # when the caller provided its own msg_id (e.g. /members).
+    data.setdefault("from_host", a.get_advertised_host())
     return a.s2s.send_json(host, data)
 
 
@@ -505,13 +505,11 @@ def _handle_remote_pm(a, ctx, remote_user, remote_host, private_message, recipie
         status = isinstance(resp, dict) and resp.get("status") == "ok"
         if isinstance(resp, dict) and resp.get("reason") == "user_not_found":
             send_to_client(ctx.session.client_socket, "User does not exist.", ctx.client_key)
-            _kick_user(a, recipient_display)
             return
         if status:
             send_to_client(ctx.session.client_socket, f"Private message sent to {recipient_display}.", ctx.client_key)
         else:
             send_to_client(ctx.session.client_socket, f"Failed to send private message to {recipient_display}.", ctx.client_key)
-            _kick_user(a, recipient_display)
     except Exception:
         send_to_client(ctx.session.client_socket, f"Failed to send private message to {recipient_display}.", ctx.client_key)
 

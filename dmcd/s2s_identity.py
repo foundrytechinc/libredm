@@ -148,38 +148,56 @@ class S2SIdentity:
         return True
 
 
+def _is_public_ip(addr: str) -> bool:
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
 def is_allowed_s2s_host(host: str) -> bool:
     """Federation policy: allowlist + reject private/reserved destinations."""
+    return resolve_public_s2s_addr(host) is not None
+
+
+def resolve_public_s2s_addr(host: str):
+    """Validate host and return a concrete public IP to connect to.
+
+    Resolving here and returning the IP (instead of the hostname) closes the
+    DNS-rebinding TOCTOU: the address that was checked is the address that
+    will be dialed.
+    """
     if not host or not isinstance(host, str):
-        return False
+        return None
     if len(host) > 255 or any(c in host for c in " \t\r\n/\\@"):
-        return False
+        return None
     allow = getattr(config, "S2S_ALLOWED_HOSTS", []) or []
     if allow and host not in allow:
-        return False
+        return None
     if not getattr(config, "S2S_BLOCK_PRIVATE_HOSTS", True):
-        return True
+        return host
     try:
-        import ipaddress
         import socket
         infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
     except Exception:
-        return False
+        return None
     if not infos:
-        return False
+        return None
     for info in infos:
         addr = info[4][0]
-        try:
-            ip = ipaddress.ip_address(addr)
-        except ValueError:
-            return False
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
-            return False
-    return True
+        if not _is_public_ip(addr):
+            return None
+    # Prefer IPv4 for the actual connect.
+    for info in infos:
+        if info[0] == socket.AF_INET:
+            return info[4][0]
+    return infos[0][4][0]

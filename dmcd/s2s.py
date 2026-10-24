@@ -102,9 +102,17 @@ class S2SLink:
 
     # -- plain transport ---------------------------------------------------
 
+    def _connect(self, host, timeout):
+        """Dial a validated public address for host (anti DNS-rebinding)."""
+        from dmcd.s2s_identity import resolve_public_s2s_addr
+        addr = resolve_public_s2s_addr(host)
+        if not addr:
+            raise ConnectionRefusedError(f"S2S destination not allowed: {host}")
+        return socket.create_connection((addr, self.port), timeout=timeout)
+
     def _plain_send(self, host, data, timeout, wait_response):
         payload = (json.dumps(data, ensure_ascii=False) + "\n").encode("utf-8")
-        with socket.create_connection((host, self.port), timeout=timeout) as sock:
+        with self._connect(host, timeout) as sock:
             _tcp_nodelay(sock)
             sock.sendall(payload)
             if not wait_response:
@@ -123,7 +131,7 @@ class S2SLink:
     # -- encrypted transport -----------------------------------------------
 
     def _open_encrypted_session(self, host, timeout):
-        sock = socket.create_connection((host, self.port), timeout=timeout)
+        sock = self._connect(host, timeout)
         _tcp_nodelay(sock)
         sock.settimeout(timeout)
         sock.sendall(config.S2S_MAGIC)
@@ -154,7 +162,7 @@ class S2SLink:
         return sess
 
     def _encrypted_send(self, host, data, timeout, wait_response):
-        sock = socket.create_connection((host, self.port), timeout=timeout)
+        sock = self._connect(host, timeout)
         try:
             _tcp_nodelay(sock)
             sock.settimeout(timeout)
@@ -187,7 +195,7 @@ class S2SLink:
         data = {"type": "s2s_cap", "from_host": self.my_host_fn()}
         try:
             payload = (json.dumps(data, ensure_ascii=False) + "\n").encode("utf-8")
-            with socket.create_connection((host, self.port), timeout=timeout) as sock:
+            with self._connect(host, timeout) as sock:
                 _tcp_nodelay(sock)
                 sock.sendall(payload)
                 sock.settimeout(config.S2S_CAP_PROBE_TIMEOUT)

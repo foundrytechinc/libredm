@@ -7,7 +7,12 @@ from dmcd.rooms import (
 )
 from dmcd.s2s import generate_msg_id, log_message
 from dmcd.sessions import send_to_client
-from dmcd.sanitize import sanitize_text, strip_controls
+from dmcd.sanitize import (
+    sanitize_room_name,
+    sanitize_text,
+    sanitize_username,
+    strip_controls,
+)
 
 
 def _close(sock):
@@ -23,6 +28,16 @@ def _client_ip(client_address):
     return str(client_address)
 
 
+def _sanitize_host(host) -> str:
+    """Conservative hostname check for S2S origin fields."""
+    host = strip_controls(str(host or ""))
+    if not host or len(host) > 255:
+        return ""
+    if any(c in host for c in " \t\r\n/\\@:"):
+        return ""
+    return host
+
+
 def process_s2s_message(msg, reply, sock, client_address, a):
     ip = _client_ip(client_address)
     if not a.s2s_limiter.allow(ip):
@@ -36,10 +51,15 @@ def process_s2s_message(msg, reply, sock, client_address, a):
         return
 
     msg_type = msg.get("type")
-    from_host = msg.get("from_host")
+    from_host = _sanitize_host(msg.get("from_host"))
     msg_id = msg.get("msg_id")
 
     # Capability probe is unauthenticated by design (discovery only).
+    if msg_type != "s2s_cap" and not from_host:
+        reply({"status": "error", "reason": "bad_request"})
+        _close(sock)
+        return
+
     if msg_type != "s2s_cap" and config.S2S_REQUIRE_SIGNATURE:
         identity = getattr(a, "s2s_identity", None)
         if identity is None or not identity.verify_message(msg, from_host):
@@ -93,8 +113,8 @@ def process_s2s_message(msg, reply, sock, client_address, a):
                     reply({"status": "error", "reason": "Dialback failed"})
                     _close(sock)
                     return
-                sender = strip_controls(str(msg.get("sender") or ""))[: config.MAX_USERNAME_LENGTH]
-                recipient = strip_controls(str(msg.get("recipient") or ""))[: config.MAX_USERNAME_LENGTH]
+                sender = sanitize_username(str(msg.get("sender") or ""))
+                recipient = sanitize_username(str(msg.get("recipient") or ""))
                 message = sanitize_text(str(msg.get("message") or ""))
                 if not sender or not recipient or not message:
                     reply({"status": "error", "reason": "bad_request"})
@@ -167,15 +187,15 @@ def process_s2s_message(msg, reply, sock, client_address, a):
     ):
         def _room_worker():
             try:
-                room = msg.get("room")
-                sender = msg.get("sender", "")
+                room_raw = msg.get("room")
+                sender_raw = msg.get("sender", "")
 
                 # Dialback: peer must prove it originated this message.
                 # Compare against the original fields (do not sanitize first).
                 ok = a.dialback.check(
                     from_host, msg_id, msg_type,
-                    sender=sender if msg_type != "room_members_request" else None,
-                    room=room,
+                    sender=sender_raw if msg_type != "room_members_request" else None,
+                    room=room_raw,
                     event=msg.get("event") if msg_type == "room_event" else None,
                 )
                 if not ok:
@@ -183,7 +203,12 @@ def process_s2s_message(msg, reply, sock, client_address, a):
                     _close(sock)
                     return
 
-                sender = strip_controls(str(sender or ""))[: config.MAX_USERNAME_LENGTH]
+                room = sanitize_room_name(str(room_raw or ""))
+                sender = sanitize_username(str(sender_raw or ""))
+                if not room or (msg_type != "room_members_request" and not sender):
+                    reply({"status": "error", "reason": "bad_request"})
+                    _close(sock)
+                    return
 
                 if msg_type == "room_event":
                     _handle_room_event(a, msg, from_host, reply, sock)
@@ -274,8 +299,8 @@ def process_s2s_message(msg, reply, sock, client_address, a):
 
 def _handle_room_event(a, msg, from_host, reply, sock):
     event = msg.get("event")
-    sender = strip_controls(str(msg.get("sender") or ""))[: config.MAX_USERNAME_LENGTH]
-    sender_origin = msg.get("sender_origin") or from_host
+    sender = sanitize_username(str(msg.get("sender") or ""))
+    sender_origin = _sanitize_host(msg.get("sender_origin")) or from_host
     payload = msg.get("payload") or {}
     if not isinstance(payload, dict):
         payload = {}
@@ -285,7 +310,11 @@ def _handle_room_event(a, msg, from_host, reply, sock):
         payload["text"] = sanitize_text(str(payload.get("text") or ""))
     if "act" in payload:
         payload["act"] = sanitize_text(str(payload.get("act") or ""), 200)
-    room = msg.get("room")
+    room = sanitize_room_name(str(msg.get("room") or ""))
+    if not room or not sender:
+        reply({"status": "error", "reason": "bad_request"})
+        _close(sock)
+        return
 
     if from_host != config.MY_SERVER_HOST and (sender, sender_origin) in a.rooms.members_map(room):
         room_key = room

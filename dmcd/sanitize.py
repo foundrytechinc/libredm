@@ -77,11 +77,16 @@ def is_reserved_username(username: str) -> bool:
 
 
 def sanitize_room_name(name: str) -> str:
-    """Safe local room/server directory name."""
+    """Safe local room/server directory name.
+
+    '@' is rejected: room@host is the federation syntax, so a local name
+    containing '@' would be misparsed as a remote room.
+    """
     if not isinstance(name, str):
         return ""
     name = strip_controls(name)
     name = name.replace("/", "_").replace("\\", "_").replace("\x00", "")
+    name = name.replace("@", "_")
     name = name.replace("..", "_")
     name = name.strip(".")
     return name[: config.MAX_USERNAME_LENGTH] or ""
